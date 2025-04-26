@@ -1,0 +1,36 @@
+# Ignore build outputs
+/build/
+/bin/
+/Debug/
+/Release/
+/*.exe
+/*.lib
+/*.dll
+/*.pdb
+/*.obj
+/*.exp
+
+# Ignore CUDA intermediate files
+*.cu.d
+*.fatbin
+*.cubin
+
+# Ignore Visual Studio settings
+.vscode/
+*.vcxproj.user
+*.suo
+*.sln.docstates
+*.ipch/
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+
+# CMake stuff
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Ignore logs
+*.log
