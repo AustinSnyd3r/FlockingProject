@@ -3,10 +3,16 @@
 #include <GLM/glm.hpp>
 #include <iostream>
 #include <vector>
+#include <utility>
 
 struct Boid {
   float x, y;
   float vx, vy;
+};
+
+struct Point {
+  float x, y;
+  Point(float x_, float y_) : x(x_), y(y_){}
 };
 
 void updateBoids(float deltaTime, std::vector<Boid> &flock, float wAlign, float wCohesion, float wSeperate) {
@@ -100,6 +106,48 @@ void updateBoids(float deltaTime, std::vector<Boid> &flock, float wAlign, float 
     }
 }
 
+// Cpu based version, need to adapt for use inside of cuda.
+int getBinIndex(const &pos, int gridWidth, int gridHeight) {
+    float clampedX = std::max(-1.0f, std::min(1.0f, pos.x));
+    float clampedY = std::max(-1.0f, std::min(1.0f, pos.y));
+
+    // Convert opengl based position to 0, 1 range
+    float normX = (clampedX + 1.0f) / 2.0f;
+    float normY = (clampedY + 1.0f) / 2.0f;
+
+    // scale to grid coordinates
+    int binX = std::min(static_cast<int>(normX * gridWidth), gridWidth - 1);
+    int binY = std::min(static_cast<int>(normY * gridHeight), gridHeight - 1);
+
+    // flatten 2D bin index to 1-d
+    return binY * gridWidth + binX;
+}
+
+// Imagine it is called with -1, 1 as the bottomleft and topright
+void divideToBins(char numBins, std::vector<std::pair<Point, Point>> &binBounds, Point bottomLeft, Point topRight) {
+  if(numBins == 1){
+    binBounds.push_back(std::pair<Point, Point>(bottomLeft, topRight));
+    return;
+  }
+
+  if(numBins < 1){
+     std::cerr << "Number of bins must be an even number. Function recieved: "<< numBins << std::endl;
+     exit(-1);
+  }
+  // We know the edges of the screen are -1, -1 (bottom left), 1, -1 (bottom right) -1, 1 (top left) 1, 1 (top right)
+  // If we want 4 bins, then center of all of these bins will be 0, 0
+  // Essentially we divided the screen into 2 on horizontal and vertical
+
+  // The center point.
+  Point center((bottomLeft.x + topRight.x) / 2.0f, (bottomLeft.y + topRight.y) / 2.0f);
+
+  divideToBins(numBins / 4, binBounds, bottomLeft, center);
+  divideToBins(numBins / 4, binBounds, Point(center.x, bottomLeft.y), Point(topRight.x, center.y));
+  divideToBins(numBins / 4, binBounds, Point(bottomLeft.x, center.y), Point(center.x, topRight.y));
+  divideToBins(numBins / 4, binBounds, center, topRight);
+
+}
+
 
 void drawBoids(std::vector<Boid>& flock) {
     glBegin(GL_TRIANGLES);
@@ -141,8 +189,29 @@ void drawBoids(std::vector<Boid>& flock) {
     glEnd();
 }
 
+void drawBins(std::vector<std::pair<Point, Point>> &bins) {
+	for(const std::pair<Point, Point>& b : bins) {
+        glBegin(GL_LINE_LOOP);
+    	glVertex2f(b.first.x, b.first.y); // Bottom Left
+		glVertex2f(b.second.x, b.first.y); // Bottom Right
+		glVertex2f(b.second.x, b.second.y); // Top Right
+		glVertex2f(b.first.x, b.second.y); // Top Left
 
-int main(int argc, char** argv) {
+
+int CPU(int argc, char** argv) {
+  	std::vector<std::pair<Point, Point>> binBounds;
+    Point bottomLeft(-1, -1);
+ 	Point topRight(1, 1);
+
+  	divideToBins(64, binBounds, bottomLeft, topRight);
+	for(const auto& b : binBounds) {
+    	std::cout << "Bottom Left " << std::endl;
+    	std::cout << b.first.x << ", " << b.first.y << std::endl;
+
+		std::cout << "Top Right " << std::endl;
+    	std::cout << b.second.x << ", " << b.second.y << std::endl;
+	}
+
   	int numBoids = 100;
 	float wAlign = 0.5f;
     float wCohesion = 5.0f;
@@ -195,6 +264,7 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         updateBoids(deltaTime, flock, wAlign, wCohesion, wSeperate);
         drawBoids(flock);
+        drawBins(binBounds);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
