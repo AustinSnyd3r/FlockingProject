@@ -22,8 +22,7 @@ include_directories(
 
 # Define your sources
 set(SOURCES
-        main.cpp
-        src/cuda/updateBoids.cu
+        main.cu
         src/render/render.cpp
 )
 
