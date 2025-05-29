@@ -29,10 +29,10 @@ __host__ void createBoidVBO(GLuint* vbo, int numBoids);
 
 
 vector<pair<float, float>> importDataset(std::string fileName);
-void render(vector<vector<float>> adjacencyList, vector<glm::vec2> nodePositions);
+void render(vector<vector<float>>& adjacencyList, vector<glm::vec2>& nodePositions, vector<int>& route);
 void drawCircle(glm::vec2 center, float r);
-vector<glm::vec2> computeNodePositions(int numNodes, vector<pair<float, float>> coords);
-vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>> coords);
+vector<glm::vec2> computeNodePositions(int numNodes, vector<pair<float, float>>& coords);
+vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>>& coords);
 
 
 int CUDA(int argc, char** argv);
@@ -257,8 +257,8 @@ int CUDA(int argc, char** argv) {
 
     // MAIN LOOP, EACH ITERATION IS A TIME STEP!!!!
     while (!glfwWindowShouldClose(window)) {
-        double currentTime = glfwGetTime();
-        float deltaTime = static_cast<float>(currentTime - lastTime);
+        const double currentTime = glfwGetTime();
+        const auto deltaTime = static_cast<float>(currentTime - lastTime);
         lastTime = currentTime;
 
         float4* devBoidPos;
@@ -306,14 +306,22 @@ int CUDA(int argc, char** argv) {
 }
 
 
-
+vector<int> antColonyTSP(const vector<vector<float>>& adj, int N);
 int main(int argc, char** argv) {
-    // Removed CPU version entirely
 
-    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\uy734.tsp");
+    //TODO: Take in command line args for this later.
+    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\wi29.tsp");
     int N = coordinates.size();
+
+    // Convert the coordinates into a adjacency list
     vector<vector<float>> graph = convertToGraph(N, coordinates);
     vector<glm::vec2> nodesVis = computeNodePositions(N, coordinates);
+
+    auto result = antColonyTSP(graph, N);
+    for(int i : result) {
+        cout << i << ", ";
+    }
+
 
     if (!glfwInit()) return -1;
 
@@ -333,7 +341,7 @@ int main(int argc, char** argv) {
     glLoadIdentity();
 
     while (!glfwWindowShouldClose(window)) {
-        render(graph, nodesVis);
+        render(graph, nodesVis, result);
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
@@ -442,21 +450,13 @@ vector<pair<float, float>> importDataset(std::string fileName) {
     return coordinates;
 }
 
-vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>> coordinates) {
+vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>>& coordinates) {
     // Now we want to actually make the graph representation now, in adjacency list.
     std::vector<std::vector<float>> dist(dimension, std::vector<float>(dimension));
     for(int i = 0; i < dimension; i++) {
         for(int j = 0; j < dimension; j++) {
             dist[i][j] = euclideanDistance(coordinates[i], coordinates[j]);
         }
-    }
-
-    // Lets see if it was made correctly.
-    for(const auto& coord : dist) {
-        for(int i = 0; i < dimension; i++) {
-            std::cout << coord[i] << ", ";
-        }
-        std::cout << std::endl;
     }
 
     return dist;
@@ -469,7 +469,7 @@ vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>> c
  * @param coordinates
  * @return
  */
-vector<glm::vec2> computeNodePositions(int N, vector<pair<float, float>> coordinates) {
+vector<glm::vec2> computeNodePositions(const int N, vector<pair<float, float>>& coordinates) {
     vector<glm::vec2> nodePositions(0);
     float minX = numeric_limits<float>::infinity();
     float maxX = -numeric_limits<float>::infinity();
@@ -514,31 +514,44 @@ void drawCircle(glm::vec2 center, float r) {
     glEnd();
 }
 
+void drawRadius(glm::vec2 center, float r) {
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(center.x, center.y);
+
+    for (int i = 0; i <= 20; i++) {
+        float theta = 2.0f * PI * i / 20;
+        glVertex2f(center.x + r * cos(theta), center.y + r * sin(theta));
+    }
+
+    glEnd();
+}
+
 /**
  *  This will render the traveling salesman problem as a graph.
  *  Only really works if you have a small number of nodes, otherwise it is just a hulking mass of
  *  blue and white.
  */
-void render(vector<vector<float>> adjacencyList, vector<glm::vec2> nodePositions) {
+void render(vector<vector<float>>& adjacencyList, vector<glm::vec2>& nodePositions, vector<int>& route) {
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glColor3f(1.0f, 1.0f, 1.0f);
+    glColor3f(1.0f, 0.0f, 0.0f);
     glBegin(GL_LINES);
-    for (int i = 0; i < adjacencyList.size(); ++i) {
-        for (int j = 0; j < adjacencyList[i].size(); j++) {
-
-            glm::vec2 a = nodePositions[i];
-            glm::vec2 b = nodePositions[j];
-            glVertex2f(a.x, a.y);
-            glVertex2f(b.x, b.y);
-
-        }
+    for (int i = 1; i < route.size(); ++i) {
+        glm::vec2 a = nodePositions[route[i-1]];
+        glm::vec2 b = nodePositions[route[i]];
+        glVertex2f(a.x, a.y);
+        glVertex2f(b.x, b.y);
     }
+
     glEnd();
 
-    glColor3f(0.2f, 0.6f, 1.0f);
+
     for (const auto& pos : nodePositions) {
-        drawCircle(pos, 0.01f);
+        glColor3f(0.2f, 0.6f, 1.0f);
+        drawCircle(pos, 0.004f);
+
+        glColor3f(0.2f, 1.0f, .2f);
+        drawRadius(pos, 0.02);
     }
 }
 
