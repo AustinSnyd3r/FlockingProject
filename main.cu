@@ -13,6 +13,7 @@
 #include <fstream>
 #include <string>
 #include <iostream>
+#include <random>
 #include <sstream>
 using namespace std;
 
@@ -55,7 +56,7 @@ __device__ int getBinIndex(float x, float y, int gridWidth, int gridHeight) {
     return iy * gridWidth + ix;
 }
 
-/**s
+/**
  *
  * @param boids
  * @param boidBinIndices
@@ -309,14 +310,14 @@ int CUDA(int argc, char** argv) {
 int main(int argc, char** argv) {
     // Removed CPU version entirely
 
-    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\dj38.tsp");
+    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\uy734.tsp");
     int N = coordinates.size();
     vector<vector<float>> graph = convertToGraph(N, coordinates);
     vector<glm::vec2> nodesVis = computeNodePositions(N, coordinates);
 
     if (!glfwInit()) return -1;
 
-    GLFWwindow* window = glfwCreateWindow(1200, 1200, "Graph Visualizer", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(900, 900, "Graph Visualizer", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -513,10 +514,15 @@ void drawCircle(glm::vec2 center, float r) {
     glEnd();
 }
 
+/**
+ *  This will render the traveling salesman problem as a graph.
+ *  Only really works if you have a small number of nodes, otherwise it is just a hulking mass of
+ *  blue and white.
+ */
 void render(vector<vector<float>> adjacencyList, vector<glm::vec2> nodePositions) {
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glColor3f(1.0f, 1.0f, 1.0f); // white lines
+    glColor3f(1.0f, 1.0f, 1.0f);
     glBegin(GL_LINES);
     for (int i = 0; i < adjacencyList.size(); ++i) {
         for (int j = 0; j < adjacencyList[i].size(); j++) {
@@ -530,8 +536,138 @@ void render(vector<vector<float>> adjacencyList, vector<glm::vec2> nodePositions
     }
     glEnd();
 
-    glColor3f(0.2f, 0.6f, 1.0f); // blue nodes
+    glColor3f(0.2f, 0.6f, 1.0f);
     for (const auto& pos : nodePositions) {
         drawCircle(pos, 0.01f);
     }
+}
+
+
+
+void constructDisks() {
+}
+
+
+/**
+ *
+ * I SHOULD SEPERATE THE FUNCTIONALITY FOR THE ANT COLONY RELATED STUFF INTO A SEPERATE FILE, BUT NOT YET!
+ *
+ */
+const int ANTS = 100;   // number of ants in each generation
+const int ITERATIONS = 100; // num of iterations
+const float ALPHA = 1.0f;  // pheromone importance
+const float BETA = 5.0f;   // distance importance
+const float EVAPORATION = 0.5f; // rate of pheremone evaporation
+const float Q = 100.0f; // weight
+
+
+float distance(int from, int to, const vector<vector<float>>& adj) {
+    return adj[from][to];
+}
+
+
+float computePathLength(const vector<int>& path, const vector<vector<float>>& adj, int N) {
+    float len = 0.0f;
+    for (int i = 0; i < N; i++)
+        len += distance(path[i], path[(i + 1) % N], adj);
+
+    return len;
+}
+
+vector<int> constructSolution(int baseStationIdx, const vector<vector<float>>& pheromones, const vector<vector<float>>& adj, mt19937& rng, int N) {
+    // path will hold the ants solution, push the base station since it must go there.
+    vector<int> path;
+    path.push_back(baseStationIdx);
+
+    // Set up the visited list and mark the base station as visited.
+    vector<bool> visited(N, false);
+    visited[baseStationIdx] = true;
+
+    // Visit all of the sensors
+    for (int step = 1; step < N; ++step) {
+        int current = path.back();
+        vector<float> probabilities(N, 0.0f);
+        float sum = 0.0f;
+
+        for (int j = 0; j < N; ++j) {
+            if (!visited[j]) {
+                // T_ij^ALPHA
+                float tau = pow(pheromones[current][j], ALPHA);
+                // n_ij^BETA
+                float eta = pow(1.0f / distance(current, j, adj), BETA);
+
+                // Update the probability of traveling to the node N
+                probabilities[j] = tau * eta;
+                sum += probabilities[j];
+            }
+        }
+
+        // Randomly choose the next sensor to visit, do while since apparently the discrete dist doesn't know to ignore 0 probabilites.
+        discrete_distribution<int> dist(probabilities.begin(), probabilities.end());
+        int next;
+        do {
+            next = dist(rng);
+        } while (visited[next]);
+
+        // Add the next sensor to the ants route and mark as visited
+        path.push_back(next);
+        visited[next] = true;
+    }
+
+
+    //TODO: We may want to add the path back to base station later, but we need to be careful.
+    //      since we do not want ants to learn to travel super far away due to pheremones added by this path being used EVERY TIME.
+    return path;
+}
+
+
+/**
+ * This is going to be used as the initial way to generate some candidate solutions to the DMRP-wLA
+ *
+ * After this, we account for the radius of communication of the sensors within the graph, to optimize actual path.
+ */
+vector<int> antColonyTSP(const vector<vector<float>>& adj, int N) {
+    N = adj.size();
+    vector<vector<float>> pheromone(N, vector<float>(N, 1.0f));
+    mt19937 rng(random_device{}());
+
+    vector<int> bestPath;
+    float bestLength = numeric_limits<float>::max();
+
+    for (int iter = 0; iter < ITERATIONS; ++iter) {
+        vector<vector<int>> antPaths;
+        for (int k = 0; k < ANTS; ++k) {
+            int start = k % N;
+            auto paths = constructSolution(start, pheromone, adj, rng, N);
+            float len = computePathLength(paths, adj, N);
+
+            if (len < bestLength) {
+                bestLength = len;
+                bestPath = paths;
+            }
+
+            antPaths.push_back(paths);
+        }
+
+        // Evaporate off some of the previous iterations pheremone.
+        for (auto& row : pheromone)
+            for (float& p : row)
+                p *= (1.0f - EVAPORATION);
+
+        // Deposit the pheremone.
+        for (const auto& path : antPaths) {
+            // Check the length of the path made.
+            float len = computePathLength(path, adj, N);
+            for (int i = 0; i < N; i++) {
+                int fromNode = path[i];
+                int toNode = path[(i + 1) % N];
+
+                // Place the pheromone onto both directions of the route.
+                pheromone[fromNode][toNode] += Q / len;
+                pheromone[toNode][fromNode] += Q / len;
+            }
+        }
+    }
+
+    return bestPath;
 }
