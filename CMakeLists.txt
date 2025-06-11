@@ -23,7 +23,7 @@ include_directories(
 # Define your sources
 set(SOURCES
         main.cu
-        src/render/render.cpp
+        rendering/RenderHelpers.cpp
 )
 
 # Add executable

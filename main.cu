@@ -15,321 +15,64 @@
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <thread>
+#include <chrono>
+#include "config.h"
+#include "./rendering/RenderHelpers.h"
+#include <cuda.h>
+#include <curand_kernel.h>
+#include <vector>
+#include <float.h>
+#include <iostream>
+
 using namespace std;
 
 #define USE_CPU false
-#define PI 3.14159265358979323846f
-
-cudaGraphicsResource* cudaBoidVBOResource;
-GLuint boidVBO;
-
-__host__ void createBoidVBO(GLuint* vbo, int numBoids);
 
 
+// NOTE: RIGHT NOW THIS IS THE MAX NUMBER OF CITIES THAT CAN BE USED. WE CAN INFLATE IT
+// BUT WE REALLY SHOULD ADD IN DYNAMIC MEMORY ALLOCATION FOR IT INSTEAD IF POSSIBLE
+#define MAX_N 1024
+const float LEARNING_RATE = 0.01f;
+const int MAX_ITER = 1000;
+const float GRAD_EPSILON = 1e-4f;
 
+vector<pair<float, float>> importDataset(string fileName);
 
-vector<pair<float, float>> importDataset(std::string fileName);
-void render(vector<vector<float>>& adjacencyList, vector<glm::vec2>& nodePositions, vector<int>& route);
-void drawCircle(glm::vec2 center, float r);
-vector<glm::vec2> computeNodePositions(int numNodes, vector<pair<float, float>>& coords);
-vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>>& coords);
+vector<glm::vec2> computeNodePositions(int numNodes, const vector<pair<float, float>>& coords);
+vector<vector<float>> convertToGraph(int dimension, const vector<pair<float, float>>& coords);
+vector<glm::vec2> gradientDescentPathOptimization(const vector<int>& route, const vector<glm::vec2>& nodePositions);
+bool isInsideCircle(float x, float y, float cx, float cy, float r);
+float euclideanDistance(const glm::vec2& a, const glm::vec2& b);
+float euclideanDistance(const pair<float, float>& p1, const pair<float, float>& p2);
+float totalPathLength(const std::vector<glm::vec2>& path);
+float distance(int from, int to, const vector<vector<float>>& adj);
+float computePathLength(const vector<int>& path, const vector<vector<float>>& adj, int N);
+vector<int> constructSolution(int baseStationIdx, const vector<vector<float>>& pheromones, const vector<vector<float>>& adj, mt19937& rng, int N);
+std::vector<int> antColonyCUDA(const std::vector<std::vector<float>>& adj, int N, int baseStationIdx);
 
-
-int CUDA(int argc, char** argv);
-
-/**
- *
- * @param x
- * @param y
- * @param gridWidth
- * @param gridHeight
- * @return
- */
-__device__ int getBinIndex(float x, float y, int gridWidth, int gridHeight) {
-    float normX = (x + 1.0f) * 0.5f;
-    float normY = (y + 1.0f) * 0.5f;
-
-    int ix = min(max(int(normX * gridWidth), 0), gridWidth - 1);
-    int iy = min(max(int(normY * gridHeight), 0), gridHeight - 1);
-
-    // Return the index of the bin the boid is in.
-    return iy * gridWidth + ix;
-}
-
-/**
- *
- * @param boids
- * @param boidBinIndices
- * @param numBoids
- * @param gridWidth
- * @param gridHeight
- */
-__global__ void assignBoidsToBins(float4* boids, int* boidBinIndices, int numBoids, int gridWidth, int gridHeight) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= numBoids) return;
-    float4 b = boids[tid];
-    int binIdx = getBinIndex(b.x, b.y, gridWidth, gridHeight);
-    boidBinIndices[tid] = binIdx;
-}
-
-
-/**
- *
- * @param boidBinIndices
- * @param binStart
- * @param binEnd
- * @param numBoids
- */
-__global__ void computeBinRanges(int* boidBinIndices, int* binStart, int* binEnd, int numBoids) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= numBoids) return;
-
-    int currentBin = boidBinIndices[tid];
-
-    if (tid == 0 || boidBinIndices[tid - 1] != currentBin)
-        binStart[currentBin] = tid;
-
-    if (tid == numBoids - 1 || boidBinIndices[tid + 1] != currentBin)
-        binEnd[currentBin] = tid + 1;
-}
-
-
-/**
- *
- * @param deltaTime
- * @param boids
- * @param wAlign
- * @param wCohesion
- * @param wSeperate
- * @param numBoids
- */
-__global__ void updateBoids(float deltaTime, float4* boids, float wAlign, float wCohesion, float wSeperate, int numBoids) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= numBoids) return;
-
-    // Variable setup.
-    const float neighborRadius = 0.1f;
-    const float separationDistance = 0.02f;
-    const float baseSpeed = 0.3f;
-
-    // Get this threads boid
-    float4 self = boids[tid];
-
-    float avgHeadX = 0.0f, avgHeadY =0.0f;
-    float centerX = 0.0f, centerY = 0.0f;
-    float sepX = 0.0f, sepY = 0.0f;
-
-    int neighbors = 0;
-
-    // Go through and calculate the effect of ofther boids to this one
-    for (int j = 0; j < numBoids; ++j) {
-        if (j == tid) continue;
-        float4 other = boids[j];
-
-        // Distance to other boids
-        float dx = other.x - self.x;
-        float dy = other.y - self.y;
-        float distSq = dx * dx + dy * dy;
-
-        // only calculate the effect if it is within the sight of this boid
-        if (distSq < neighborRadius * neighborRadius) {
-            neighbors++;
-
-            // turn boid toward header and mass of other boid
-            avgHeadX += other.z;
-            avgHeadY += other.w;
-            centerX += other.x;
-            centerY += other.y;
-
-            // Apply seperation
-            if (distSq < separationDistance * separationDistance) {
-                sepX -= dx;
-                sepY -= dy;
-            }
-        }
-    }
-
-    if (neighbors > 0) {
-        avgHeadX /= neighbors;
-        avgHeadY /= neighbors;
-        centerX /= neighbors;
-        centerY /= neighbors;
-        self.z += (avgHeadX - self.z) * wAlign * deltaTime;
-        self.w += (avgHeadY - self.w) * wAlign * deltaTime;
-        self.z += (centerX - self.x) * wCohesion * deltaTime;
-        self.w += (centerY - self.y) * wCohesion * deltaTime;
-        self.z += sepX * wSeperate * deltaTime;
-        self.w += sepY * wSeperate * deltaTime;
-    }
-
-    float speed = sqrtf(self.z * self.z + self.w * self.w);
-    if (speed > 0.0001f) {
-        self.z = (self.z / speed) * baseSpeed;
-        self.w = (self.w / speed) * baseSpeed;
-    }
-
-    // Update based on dt
-    self.x += self.z * deltaTime;
-    self.y += self.w * deltaTime;
-
-    // do the pacman effect when boid flies to edgfe of screen.
-    if (self.x < -1.0f) self.x = 1.0f;
-    if (self.x > 1.0f) self.x = -1.0f;
-    if (self.y < -1.0f) self.y = 1.0f;
-    if (self.y > 1.0f) self.y = -1.0f;
-
-    // Update the boid in the mem
-    boids[tid] = self;
-}
-
-/**
- * Creates vertex object buffer, allows us to render our boids in between time steps with openGL
- * @param vbo   The buffer
- * @param numBoids  Number of boids needed
- */
-__host__ void createBoidVBO(GLuint* vbo, int numBoids) {
-    glGenBuffers(1, vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, *vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float4) * numBoids, nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    cudaGraphicsGLRegisterBuffer(&cudaBoidVBOResource, *vbo, cudaGraphicsMapFlagsNone);
-}
-
-
-/**
- * THIS IS THE MAIN ACTION!!! Includes the loop that is calling our CUDA functions and updating the screen by using VBO shared
- * between openGL and CUDA
- * @param argc
- * @param argv
- * @return
- */
-int CUDA(int argc, char** argv) {
-    if (!glfwInit()) return -1;
-
-    GLFWwindow* window = glfwCreateWindow(800, 800, "CUDA OpenGL Boids", nullptr, nullptr);
-    if (!window) return -1;
-
-    glfwMakeContextCurrent(window);
-    if (glewInit() != GLEW_OK) return -1;
-
-    int numBoids = 1024;
-    float wAlign = 0.5f, wCohesion = 5.0f, wSeperate = 0.6f;
-
-    // Take command line input for boids and weights.
-    if (argc > 1) numBoids = std::atoi(argv[1]);
-    if (argc > 2) wAlign = std::atof(argv[2]);
-    if (argc > 3) wCohesion = std::atof(argv[3]);
-    if (argc > 4) wSeperate = std::atof(argv[4]);
-
-    // The grid for how we will split the screen to hash locality of boids.
-    // For example, we don't really care about two far away boids interacting, since it will be minimal effect.
-    int gridWidth = 8, gridHeight = 8;
-    int totalBins = gridWidth * gridHeight;
-    std::vector<float4> cpuBoids(numBoids);
-    std::srand((unsigned)std::time(0));
-    for (int i = 0; i < numBoids; ++i) {
-        cpuBoids[i] = make_float4(
-            ((std::rand() / (float)RAND_MAX) * 2.0f - 1.0f),
-            ((std::rand() / (float)RAND_MAX) * 2.0f - 1.0f),
-            ((std::rand() / (float)RAND_MAX) - 0.5f) * 0.2f,
-            ((std::rand() / (float)RAND_MAX) - 0.5f) * 0.2f);
-    }
-
-    // Device pointers
-    float4* devBoids;
-    int* devBoidBinIdx;
-    int* devBinStart;
-    int* devBinEnd;
-
-    // VBO for rendering with the same mem as cuda uses
-    createBoidVBO(&boidVBO, numBoids);
-
-    // Allocate memory for gpu
-    cudaMalloc(&devBoids, sizeof(float4) * numBoids);
-    cudaMalloc(&devBoidBinIdx, sizeof(int) * numBoids);
-    cudaMalloc(&devBinStart, sizeof(int) * totalBins);
-    cudaMalloc(&devBinEnd, sizeof(int) * totalBins);
-
-    // Copy the initial boids ove to the gpu
-    cudaMemcpy(devBoids, cpuBoids.data(), sizeof(float4) * numBoids, cudaMemcpyHostToDevice);
-
-    double lastTime = glfwGetTime();
-
-    // MAIN LOOP, EACH ITERATION IS A TIME STEP!!!!
-    while (!glfwWindowShouldClose(window)) {
-        const double currentTime = glfwGetTime();
-        const auto deltaTime = static_cast<float>(currentTime - lastTime);
-        lastTime = currentTime;
-
-        float4* devBoidPos;
-        size_t size;
-        cudaGraphicsMapResources(1, &cudaBoidVBOResource, 0);
-        cudaGraphicsResourceGetMappedPointer((void**)&devBoidPos, &size, cudaBoidVBOResource);
-
-        int blockSize = 256;
-        int gridSize = (numBoids + blockSize - 1) / blockSize;
-
-        // Split boids into the local bins on the screen
-        assignBoidsToBins<<<gridSize, blockSize>>>(devBoids, devBoidBinIdx, numBoids, gridWidth, gridHeight);
-        thrust::device_ptr<int> binIdxPtr(devBoidBinIdx);
-        thrust::device_ptr<float4> boidPtr(devBoids);
-        thrust::sort_by_key(binIdxPtr, binIdxPtr + numBoids, boidPtr);
-
-        // Compute the range of the bins so we know
-        computeBinRanges<<<gridSize, blockSize>>>(devBoidBinIdx, devBinStart, devBinEnd, numBoids);
-        updateBoids<<<gridSize, blockSize>>>(deltaTime, devBoids, wAlign, wCohesion, wSeperate, numBoids);
-
-        cudaMemcpy(devBoidPos, devBoids, sizeof(float4) * numBoids, cudaMemcpyDeviceToDevice);
-        cudaGraphicsUnmapResources(1, &cudaBoidVBOResource, 0);
-
-        // OpenGL clear and draw updated boids
-        glClear(GL_COLOR_BUFFER_BIT);
-        glBindBuffer(GL_ARRAY_BUFFER, boidVBO);
-        glEnableClientState(GL_VERTEX_ARRAY);
-        glVertexPointer(2, GL_FLOAT, sizeof(float4), 0);
-        glDrawArrays(GL_POINTS, 0, numBoids);
-        glDisableClientState(GL_VERTEX_ARRAY);
-
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
-
-    cudaGraphicsUnregisterResource(cudaBoidVBOResource);
-    cudaFree(devBoids);
-    cudaFree(devBoidBinIdx);
-    cudaFree(devBinStart);
-    cudaFree(devBinEnd);
-    glDeleteBuffers(1, &boidVBO);
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    return 0;
-}
-
-
-vector<int> antColonyTSP(const vector<vector<float>>& adj, int N);
 int main(int argc, char** argv) {
 
     //TODO: Take in command line args for this later.
-    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\wi29.tsp");
+    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\uy734.tsp");
     int N = coordinates.size();
 
     // Convert the coordinates into a adjacency list
     vector<vector<float>> graph = convertToGraph(N, coordinates);
     vector<glm::vec2> nodesVis = computeNodePositions(N, coordinates);
 
-    auto result = antColonyTSP(graph, N);
-    for(int i : result) {
-        cout << i << ", ";
-    }
+    vector<int> acoRoute = antColonyCUDA(graph, N, 0);
 
+    vector<glm::vec2> finalRoutePos = gradientDescentPathOptimization(acoRoute, nodesVis);
 
     if (!glfwInit()) return -1;
 
-    GLFWwindow* window = glfwCreateWindow(900, 900, "Graph Visualizer", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(900, 900, "DMRP Visualized", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
     }
+
     glfwMakeContextCurrent(window);
     glewInit();
 
@@ -340,10 +83,22 @@ int main(int argc, char** argv) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
+    using Clock = std::chrono::high_resolution_clock;
+    auto lastRender = Clock::now();
+
     while (!glfwWindowShouldClose(window)) {
-        render(graph, nodesVis, result);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+        glfwPollEvents();  // Always responsive
+
+        auto now = Clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRender);
+
+        if (elapsed.count() >= 1000) {
+            RenderHelpers::render(graph, finalRoutePos, nodesVis, acoRoute);
+            glfwSwapBuffers(window);
+            lastRender = now;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));  // Light sleep to reduce CPU spin
+        }
     }
 
     glfwDestroyWindow(window);
@@ -354,51 +109,13 @@ int main(int argc, char** argv) {
     //CUDA(argc, argv);
 }
 
-
-
-
-
-
-
-
-
-
-// Data Mule Routing Problem (with Limited Autonomy)
-
 /**
- * Essentially the papers read aim to travel to wireless sensors with drones.
- * These sensors have a set radius that they can communicate with the drone to transmit information.
- * We need to leave from the "base station" and travel in a path that collects all the sensor information
- * in the smallest amount of time.
- *
- *
- * In terms of time, both training time to find the solution, and the optimality of our paths matter heavily.
- * In wild-land rescue, a model that trains for 10 hours could cause someone to never be found or even die.
- *
- *
- * Since we have sensors with a radius of communication, there are possible overlaps between sensor
- *
- *
- * I cannot find the online datasets that they used because they are locked inside a springer publication
- *
- * Instead, i have some TSP datasets that I will use and add in the radius manually. Additionally, the first
- * node in the set will be the "base"
+ * Helper function to calculate the Euclidean distance between two points.
+ * @param p1 The first x,y point
+ * @param p2 The second x,y point
+ * @return The distance between x,y.
  */
-void createDMRP(int numSensors, float radius, int numDrones) {
-
-
-
-
-}
-
-
-// Remember to ask Dr. Davendra:
-// Ant Colony Optimization with TSP / TSP with neighborhoods
-// TSP common approaches in general.
-// Papers about common algorithms in Scientific Computing and their pros and cons.
-
-
-float euclideanDistance(const std::pair<float, float>& p1, const std::pair<float, float>& p2) {
+float euclideanDistance(const pair<float, float>& p1, const pair<float, float>& p2) {
     float dist = 0.0f;
 
     dist += pow(p1.first - p2.first, 2);
@@ -408,54 +125,60 @@ float euclideanDistance(const std::pair<float, float>& p1, const std::pair<float
 }
 
 /**
- * Imports a traveling salesman type dataset.
+ * Imports a traveling salesman type dataset, we use this with a manually input radius of communication
+ * that is the same for all sensors. In the future, we should change to have each sensor have a different
+ * radius. This would be more realistic.
+ *
+ * Sample datasets used in testing:
+ * https://www.math.uwaterloo.ca/tsp/data/index.html
+ *
  */
-vector<pair<float, float>> importDataset(std::string fileName) {
-    std::ifstream file(fileName);
+vector<pair<float, float>> importDataset(string fileName) {
+    ifstream file(fileName);
     if (!file.is_open()) {
-        std::cerr << "Failed to open file.\n";
+        cerr << "Failed to open file.\n";
         exit(1);
     }
 
-    std::string line;
-    std::vector<std::pair<float, float>> coordinates;
+    string line;
+    vector<pair<float, float>> coordinates;
 
     bool readCoord = false;
     int dimension = 0;
 
-    while(std::getline(file, line)) {
+    while(getline(file, line)) {
         // We have the dimension now.
-        if(line.find("DIMENSION") != std::string::npos) {
-            dimension = std::stoi(line.substr(line.find(":") + 1));
+        if(line.find("DIMENSION") != string::npos) {
+            dimension = stoi(line.substr(line.find(":") + 1));
             coordinates.resize(dimension);
         }
 
         // We have reached the coordinate section of the dataset
-        if(line.find("NODE_COORD_SECTION") != std::string::npos) {
+        if(line.find("NODE_COORD_SECTION") != string::npos) {
             readCoord = true;
             continue;
         }
 
-        // Add in the line that is like id x y into the coords.
+        // Add in the line that is like "id x y" into the coords.
         if(readCoord) {
             // Take the line, it will be split 3 times: id, x, y
-            std::istringstream iss(line);
+            istringstream iss(line);
             int id;
             double x, y;
             if(!(iss >> id >> x >> y)) break;
-            coordinates[id - 1] = std::make_pair(x, y);
+            coordinates[id - 1] = make_pair(x, y);
         }
     }
 
     return coordinates;
 }
 
-vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>>& coordinates) {
+vector<vector<float>> convertToGraph(const int dimension, const vector<pair<float, float>>& coords) {
     // Now we want to actually make the graph representation now, in adjacency list.
-    std::vector<std::vector<float>> dist(dimension, std::vector<float>(dimension));
+    vector<vector<float>> dist(dimension, vector<float>(dimension));
     for(int i = 0; i < dimension; i++) {
         for(int j = 0; j < dimension; j++) {
-            dist[i][j] = euclideanDistance(coordinates[i], coordinates[j]);
+            dist[i][j] = euclideanDistance(coords[i], coords[j]);
         }
     }
 
@@ -465,11 +188,11 @@ vector<vector<float>> convertToGraph(int dimension, vector<pair<float, float>>& 
 
 /**
  * Convert the actual longitude and latitudes into a version we can render.
- * @param N
+ * @param numNodes
  * @param coordinates
  * @return
  */
-vector<glm::vec2> computeNodePositions(const int N, vector<pair<float, float>>& coordinates) {
+vector<glm::vec2> computeNodePositions(const int numNodes, const vector<pair<float, float>>& coordinates) {
     vector<glm::vec2> nodePositions(0);
     float minX = numeric_limits<float>::infinity();
     float maxX = -numeric_limits<float>::infinity();
@@ -477,13 +200,13 @@ vector<glm::vec2> computeNodePositions(const int N, vector<pair<float, float>>& 
     float minY = numeric_limits<float>::infinity();
     float maxY = -numeric_limits<float>::infinity();
 
-    // Get mins and maxes of the "space", i want to plot how it actually looks.
-    for(int i = 0; i < N; i++) {
-        maxX = std::max(maxX, coordinates[i].first);
-        minX = std::min(minX, coordinates[i].first);
+    // Get mins and maxes of the "space", I want to plot how it actually looks.
+    for(int i = 0; i < numNodes; i++) {
+        maxX = max(maxX, coordinates[i].first);
+        minX = min(minX, coordinates[i].first);
 
-        maxY = std::max(maxY, coordinates[i].second);
-        minY = std::min(minY, coordinates[i].second);
+        maxY = max(maxY, coordinates[i].second);
+        minY = min(minY, coordinates[i].second);
     }
 
     // Some buffer on the border
@@ -493,7 +216,7 @@ vector<glm::vec2> computeNodePositions(const int N, vector<pair<float, float>>& 
     minY -= 50;
 
     // Normalize the coordinates to a 0-1 range to allow visualization
-    for (int i = 0; i < N; ++i) {
+    for (int i = 0; i < numNodes; ++i) {
         float x = (coordinates[i].first - minX) / (maxX - minX);
         float y = (coordinates[i].second - minY) / (maxY - minY);
         nodePositions.emplace_back(x, y);
@@ -502,62 +225,96 @@ vector<glm::vec2> computeNodePositions(const int N, vector<pair<float, float>>& 
     return nodePositions;
 }
 
-void drawCircle(glm::vec2 center, float r) {
-    glBegin(GL_TRIANGLE_FAN);
-    glVertex2f(center.x, center.y);
 
-    for (int i = 0; i <= 20; ++i) {
-        float theta = 2.0f * PI * i / 20;
-        glVertex2f(center.x + r * cos(theta), center.y + r * sin(theta));
-    }
 
-    glEnd();
+bool isInsideCircle(const float x, const float y, const float cx, const float cy, const float r) {
+    const float dx = x - cx;
+    const float dy = y - cy;
+    return (dx * dx + dy * dy) <= (r * r);
 }
 
-void drawRadius(glm::vec2 center, float r) {
-    glBegin(GL_LINE_LOOP);
-    glVertex2f(center.x, center.y);
-
-    for (int i = 0; i <= 20; i++) {
-        float theta = 2.0f * PI * i / 20;
-        glVertex2f(center.x + r * cos(theta), center.y + r * sin(theta));
-    }
-
-    glEnd();
+float euclideanDistance(const glm::vec2& a, const glm::vec2& b) {
+    return glm::length(b - a);
 }
+
 
 /**
- *  This will render the traveling salesman problem as a graph.
- *  Only really works if you have a small number of nodes, otherwise it is just a hulking mass of
- *  blue and white.
+ * Simple helper function that computes the distance that the path takes overall.
+ * @param path The vector of glm::vec2, these are (x,y) coordinates.
+ * @return The total length of the path in some arbitary unit.
  */
-void render(vector<vector<float>>& adjacencyList, vector<glm::vec2>& nodePositions, vector<int>& route) {
-    glClear(GL_COLOR_BUFFER_BIT);
+float totalPathLength(const std::vector<glm::vec2>& path) {
+    float total = 0.0f;
 
-    glColor3f(1.0f, 0.0f, 0.0f);
-    glBegin(GL_LINES);
-    for (int i = 1; i < route.size(); ++i) {
-        glm::vec2 a = nodePositions[route[i-1]];
-        glm::vec2 b = nodePositions[route[i]];
-        glVertex2f(a.x, a.y);
-        glVertex2f(b.x, b.y);
+    for (int i = 0; i + 1 < path.size(); i++) {
+        total += euclideanDistance(path[i], path[i + 1]);
     }
 
-    glEnd();
-
-
-    for (const auto& pos : nodePositions) {
-        glColor3f(0.2f, 0.6f, 1.0f);
-        drawCircle(pos, 0.004f);
-
-        glColor3f(0.2f, 1.0f, .2f);
-        drawRadius(pos, 0.02);
-    }
+    return total;
 }
 
 
+std::vector<glm::vec2> gradientDescentPathOptimization(const std::vector<int>& route, const std::vector<glm::vec2>& nodePositions) {
 
-void constructDisks() {
+    if (route.empty()) return {};
+
+    std::vector<glm::vec2> path(route.size());
+    for (size_t i = 0; i < route.size(); ++i) {
+        path[i] = nodePositions[route[i]];
+    }
+
+    cout << "Route has same length as path: " << (path.size() == route.size()) << endl;
+    for(int i = 1; i < route.size(); ++i) {
+        auto p = path[i];
+        cout << route[i] << " Location: ";
+        cout << p.x << ", " << p.y << endl;
+    }
+
+    for (int iter = 0; iter < MAX_ITER; ++iter) {
+        float prevCost = totalPathLength(path);
+
+        for (int i = 1; i < static_cast<int>(route.size()) - 1; ++i) {
+            glm::vec2 prev = path[i - 1];
+            glm::vec2 next = path[i + 1];
+            glm::vec2 center = nodePositions[route[i]];
+
+            glm::vec2 curr = path[i];
+            glm::vec2 grad = glm::normalize(curr - prev) + glm::normalize(curr - next);
+            glm::vec2 proposed = curr - LEARNING_RATE * grad;
+
+            // Clamp proposed point to lie within the radius from center in 2D
+            glm::vec2 offset = proposed - center;
+            float dist = glm::length(offset);
+            if (dist > SENSOR_RADIUS) {
+                offset = (offset / dist) * SENSOR_RADIUS; // normalize and scale
+                proposed = center + offset;
+            }
+
+            // Only accept if it improves local segment cost
+            float oldCost = glm::length(curr - prev) + glm::length(curr - next);
+            float newCost = glm::length(proposed - prev) + glm::length(proposed - next);
+
+            if (newCost < oldCost) {
+                path[i] = proposed;
+            }
+        }
+
+        float newCost = totalPathLength(path);
+        if (std::abs(newCost - prevCost) < GRAD_EPSILON) break;
+    }
+
+    // Final enforcement of radius constraint (double safety)
+    for (int i = 0; i < static_cast<int>(route.size()); ++i) {
+        glm::vec2 center = nodePositions[route[i]];
+        glm::vec2 offset = path[i] - center;
+        float dist = glm::length(offset);
+        if (dist > SENSOR_RADIUS) {
+            offset = (offset / dist) * SENSOR_RADIUS;
+            path[i] = center + offset;
+        }
+    }
+
+    return path;
 }
 
 
@@ -566,121 +323,179 @@ void constructDisks() {
  * I SHOULD SEPERATE THE FUNCTIONALITY FOR THE ANT COLONY RELATED STUFF INTO A SEPERATE FILE, BUT NOT YET!
  *
  */
-const int ANTS = 100;   // number of ants in each generation
-const int ITERATIONS = 100; // num of iterations
-const float ALPHA = 1.0f;  // pheromone importance
-const float BETA = 5.0f;   // distance importance
-const float EVAPORATION = 0.5f; // rate of pheremone evaporation
-const float Q = 100.0f; // weight
+#define ANTS 100   // number of ants in each generation
+#define ITERATIONS 100 // num of iterations
+#define ALPHA 1.0f  // pheromone importance
+#define BETA 5.0f   // distance importance
+#define EVAPORATION 0.5f  // rate of pheremone evaporation
+#define Q 100.0f  // weight
 
-
-float distance(int from, int to, const vector<vector<float>>& adj) {
-    return adj[from][to];
+/**
+ * This does same thing as if we had "vector<vector<float>>& adj"
+ *  and we returned adj[from][to].
+ *
+ *  Since cuda is flattened arrays, we use this indexing scheme.
+ */
+__device__ float distance(int from, int to, float* adj, int N) {
+    return adj[from * N + to];
 }
 
-
-float computePathLength(const vector<int>& path, const vector<vector<float>>& adj, int N) {
+/**
+ * Used to be:
+ * float computePathLength(const vector<int>& path, const vector<vector<float>>& adj, int N)
+ *
+ */
+__device__ float computePathLength(int* path, float* adj, int N) {
     float len = 0.0f;
-    for (int i = 0; i < N; i++)
-        len += distance(path[i], path[(i + 1) % N], adj);
-
+    for (int i = 0; i < N; i++) {
+        int from = path[i];
+        int to = path[(i + 1) % N];
+        len += distance(from, to, adj, N);
+    }
     return len;
 }
 
-vector<int> constructSolution(int baseStationIdx, const vector<vector<float>>& pheromones, const vector<vector<float>>& adj, mt19937& rng, int N) {
-    // path will hold the ants solution, push the base station since it must go there.
-    vector<int> path;
-    path.push_back(baseStationIdx);
 
-    // Set up the visited list and mark the base station as visited.
-    vector<bool> visited(N, false);
+__global__ void initRNG(curandState* states, unsigned long seed) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < ANTS) {
+        curand_init(seed, id, 0, &states[id]);
+    }
+}
+
+
+__global__ void constructSolutions(
+    int N, int baseStationIdx, float* pheromones, float* adj,
+    int* paths, float* lengths, float* probabilities, curandState* rngStates){
+
+    int antIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (antIdx >= ANTS) return;
+
+    float* myProbabilities = &probabilities[antIdx * N];
+
+    int* path = &paths[antIdx * N];
+    bool visited[MAX_N] = {0};
+
+    path[0] = baseStationIdx;
     visited[baseStationIdx] = true;
 
-    // Visit all of the sensors
+    curandState localState = rngStates[antIdx];
+
     for (int step = 1; step < N; ++step) {
-        int current = path.back();
-        vector<float> probabilities(N, 0.0f);
+        int current = path[step - 1];
         float sum = 0.0f;
 
         for (int j = 0; j < N; ++j) {
             if (!visited[j]) {
-                // T_ij^ALPHA
-                float tau = pow(pheromones[current][j], ALPHA);
-                // n_ij^BETA
-                float eta = pow(1.0f / distance(current, j, adj), BETA);
-
-                // Update the probability of traveling to the node N
-                probabilities[j] = tau * eta;
+                float tau = powf(pheromones[current * N + j], ALPHA);
+                float eta = powf(1.0f / distance(current, j, adj, N), BETA);
+                myProbabilities[j] = tau * eta;
                 sum += probabilities[j];
+            } else {
+                myProbabilities[j] = 0.0f;
             }
         }
 
-        // Randomly choose the next sensor to visit, do while since apparently the discrete dist doesn't know to ignore 0 probabilites.
-        discrete_distribution<int> dist(probabilities.begin(), probabilities.end());
-        int next;
-        do {
-            next = dist(rng);
-        } while (visited[next]);
+        float pick = curand_uniform(&localState) * sum;
+        float cumulative = 0.0f;
+        int next = -1;
 
-        // Add the next sensor to the ants route and mark as visited
-        path.push_back(next);
+        for (int j = 0; j < N; ++j) {
+            cumulative += myProbabilities[j];
+            if (pick <= cumulative && !visited[j]) {
+                next = j;
+                break;
+            }
+        }
+
+        if (next == -1) {
+            for (int j = 0; j < N; ++j) {
+                if (!visited[j]) {
+                    next = j;
+                    break;
+                }
+            }
+        }
+
+        path[step] = next;
         visited[next] = true;
     }
 
-
-    //TODO: We may want to add the path back to base station later, but we need to be careful.
-    //      since we do not want ants to learn to travel super far away due to pheremones added by this path being used EVERY TIME.
-    return path;
+    lengths[antIdx] = computePathLength(path, adj, N);
+    rngStates[antIdx] = localState;
 }
 
+std::vector<int> antColonyCUDA(const std::vector<std::vector<float>>& adj, int N, int baseStationIdx) {
+    float* d_adj, *d_pheromones;
+    int* d_paths;
+    float* d_lengths;
+    curandState* d_rngStates;
 
-/**
- * This is going to be used as the initial way to generate some candidate solutions to the DMRP-wLA
- *
- * After this, we account for the radius of communication of the sensors within the graph, to optimize actual path.
- */
-vector<int> antColonyTSP(const vector<vector<float>>& adj, int N) {
-    N = adj.size();
-    vector<vector<float>> pheromone(N, vector<float>(N, 1.0f));
-    mt19937 rng(random_device{}());
+    int size = N * N * sizeof(float);
+    cudaMalloc(&d_adj, size);
+    cudaMalloc(&d_pheromones, size);
+    cudaMalloc(&d_paths, sizeof(int) * N * ANTS);
+    cudaMalloc(&d_lengths, sizeof(float) * ANTS);
+    cudaMalloc(&d_rngStates, sizeof(curandState) * ANTS);
 
-    vector<int> bestPath;
-    float bestLength = numeric_limits<float>::max();
+    float* adj_flat = new float[N * N];
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            adj_flat[i * N + j] = adj[i][j];
+
+    cudaMemcpy(d_adj, adj_flat, size, cudaMemcpyHostToDevice);
+
+    std::vector<float> pheromone(N * N, 1.0f);
+    cudaMemcpy(d_pheromones, pheromone.data(), size, cudaMemcpyHostToDevice);
+
+    initRNG<<<(ANTS + 31) / 32, 32>>>(d_rngStates, time(NULL));
+
+    std::vector<int> bestPath(N);
+    float bestLength = FLT_MAX;
+
+    std::vector<float> lengths(ANTS);
+    std::vector<int> paths(ANTS * N);
+
+    float* d_probabilities;
+    cudaMalloc(&d_probabilities, sizeof(float) * N * ANTS);
 
     for (int iter = 0; iter < ITERATIONS; ++iter) {
-        vector<vector<int>> antPaths;
-        for (int k = 0; k < ANTS; ++k) {
-            int start = k % N;
-            auto paths = constructSolution(start, pheromone, adj, rng, N);
-            float len = computePathLength(paths, adj, N);
 
+        constructSolutions<<<(ANTS + 31)/32, 32>>>(N, baseStationIdx, d_pheromones, d_adj, d_paths, d_lengths, d_probabilities, d_rngStates);
+
+        cudaMemcpy(lengths.data(), d_lengths, sizeof(float) * ANTS, cudaMemcpyDeviceToHost);
+        cudaMemcpy(paths.data(), d_paths, sizeof(int) * N * ANTS, cudaMemcpyDeviceToHost);
+
+        for (int i = 0; i < N * N; ++i)
+            pheromone[i] *= (1.0f - EVAPORATION);
+
+        for (int k = 0; k < ANTS; ++k) {
+            float len = lengths[k];
             if (len < bestLength) {
                 bestLength = len;
-                bestPath = paths;
+                std::copy(paths.begin() + k * N, paths.begin() + (k + 1) * N, bestPath.begin());
             }
 
-            antPaths.push_back(paths);
-        }
-
-        // Evaporate off some of the previous iterations pheremone.
-        for (auto& row : pheromone)
-            for (float& p : row)
-                p *= (1.0f - EVAPORATION);
-
-        // Deposit the pheremone.
-        for (const auto& path : antPaths) {
-            // Check the length of the path made.
-            float len = computePathLength(path, adj, N);
-            for (int i = 0; i < N; i++) {
-                int fromNode = path[i];
-                int toNode = path[(i + 1) % N];
-
-                // Place the pheromone onto both directions of the route.
-                pheromone[fromNode][toNode] += Q / len;
-                pheromone[toNode][fromNode] += Q / len;
+            for (int i = 0; i < N; ++i) {
+                int from = paths[k * N + i];
+                int to = paths[k * N + (i + 1) % N];
+                pheromone[from * N + to] += Q / len;
+                pheromone[to * N + from] += Q / len;
             }
         }
+
+        cudaMemcpy(d_pheromones, pheromone.data(), size, cudaMemcpyHostToDevice);
     }
+
+    bestPath.push_back(baseStationIdx);
+
+    cudaFree(d_adj);
+    cudaFree(d_pheromones);
+    cudaFree(d_paths);
+    cudaFree(d_lengths);
+    cudaFree(d_probabilities);
+    cudaFree(d_rngStates);
+    delete[] adj_flat;
 
     return bestPath;
 }
