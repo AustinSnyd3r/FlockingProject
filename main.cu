@@ -32,6 +32,7 @@ using namespace std;
 
 // NOTE: RIGHT NOW THIS IS THE MAX NUMBER OF CITIES THAT CAN BE USED. WE CAN INFLATE IT
 // BUT WE REALLY SHOULD ADD IN DYNAMIC MEMORY ALLOCATION FOR IT INSTEAD IF POSSIBLE
+// IT IS KIND OF A WASTE
 #define MAX_N 1024
 const float LEARNING_RATE = 0.01f;
 const int MAX_ITER = 1000;
@@ -54,7 +55,7 @@ std::vector<int> antColonyCUDA(const std::vector<std::vector<float>>& adj, int N
 int main(int argc, char** argv) {
 
     //TODO: Take in command line args for this later.
-    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\uy734.tsp");
+    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\gridAltered.tsp");
     int N = coordinates.size();
 
     // Convert the coordinates into a adjacency list
