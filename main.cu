@@ -55,7 +55,7 @@ std::vector<int> antColonyCUDA(const std::vector<std::vector<float>>& adj, int N
 int main(int argc, char** argv) {
 
     //TODO: Take in command line args for this later.
-    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\gridAltered.tsp");
+    vector<pair<float, float>> coordinates = importDataset("C:\\Users\\asnyd\\CLionProjects\\CudaOpenGLFlocking\\datasets\\dj38.tsp");
     int N = coordinates.size();
 
     // Convert the coordinates into a adjacency list
@@ -227,22 +227,48 @@ vector<glm::vec2> computeNodePositions(const int numNodes, const vector<pair<flo
 }
 
 
-
+/**
+ * @brief Checks if a point (x, y) is inside or on the boundary of a circle.
+ *
+ * This function calculates the squared Euclidean distance between the point (x, y)
+ * and the center of the circle (cx, cy), and compares it to the square of the radius.
+ *
+ * @param x  X-coordinate of the point to check.
+ * @param y  Y-coordinate of the point to check.
+ * @param cx X-coordinate of the circle center.
+ * @param cy Y-coordinate of the circle center.
+ * @param r  Radius of the circle.
+ * @return true if the point is inside or on the circle, false otherwise.
+ */
 bool isInsideCircle(const float x, const float y, const float cx, const float cy, const float r) {
     const float dx = x - cx;
     const float dy = y - cy;
     return (dx * dx + dy * dy) <= (r * r);
 }
 
+/**
+ * @brief Computes the Euclidean distance between two 2D points.
+ *
+ * Uses the `glm::length` function to calculate the magnitude of the vector
+ * difference between two `glm::vec2` points.
+ *
+ * @param a First point.
+ * @param b Second point.
+ * @return The Euclidean distance between point a and point b.
+ */
 float euclideanDistance(const glm::vec2& a, const glm::vec2& b) {
     return glm::length(b - a);
 }
 
 
 /**
- * Simple helper function that computes the distance that the path takes overall.
- * @param path The vector of glm::vec2, these are (x,y) coordinates.
- * @return The total length of the path in some arbitary unit.
+ * @brief Computes the total Euclidean length of a given 2D path.
+ *
+ * This function iterates over consecutive points in the path and sums
+ * the Euclidean distances between each pair of adjacent points.
+ *
+ * @param path A vector of glm::vec2 representing the (x, y) coordinates of the path.
+ * @return The total length of the path, in arbitrary units.
  */
 float totalPathLength(const std::vector<glm::vec2>& path) {
     float total = 0.0f;
@@ -254,7 +280,17 @@ float totalPathLength(const std::vector<glm::vec2>& path) {
     return total;
 }
 
-
+/**
+ * @brief Optimizes a given path using gradient descent while ensuring each point stays within a fixed radius of its target node.
+ *
+ * This function attempts to minimize the total path length by iteratively adjusting intermediate points along the route.
+ * Each point (except the start and end) is pulled closer to its neighbors to reduce path length while remaining within
+ * a specified SENSOR_RADIUS from its original node position. Points are clamped after each update to maintain the radius constraint.
+ *
+ * @param route A vector of integer indices representing the ordered sequence of node visits.
+ * @param nodePositions A vector of glm::vec2 representing the (x, y) coordinates of all nodes.
+ * @return A vector of glm::vec2 representing the optimized path coordinates.
+ */
 std::vector<glm::vec2> gradientDescentPathOptimization(const std::vector<int>& route, const std::vector<glm::vec2>& nodePositions) {
 
     if (route.empty()) return {};
@@ -264,13 +300,7 @@ std::vector<glm::vec2> gradientDescentPathOptimization(const std::vector<int>& r
         path[i] = nodePositions[route[i]];
     }
 
-    cout << "Route has same length as path: " << (path.size() == route.size()) << endl;
-    for(int i = 1; i < route.size(); ++i) {
-        auto p = path[i];
-        cout << route[i] << " Location: ";
-        cout << p.x << ", " << p.y << endl;
-    }
-
+    // Gradient descent optimization
     for (int iter = 0; iter < MAX_ITER; ++iter) {
         float prevCost = totalPathLength(path);
 
@@ -278,8 +308,9 @@ std::vector<glm::vec2> gradientDescentPathOptimization(const std::vector<int>& r
             glm::vec2 prev = path[i - 1];
             glm::vec2 next = path[i + 1];
             glm::vec2 center = nodePositions[route[i]];
-
             glm::vec2 curr = path[i];
+
+            // Compute the gradient as sum of unit vectors pointing away from neighbors
             glm::vec2 grad = glm::normalize(curr - prev) + glm::normalize(curr - next);
             glm::vec2 proposed = curr - LEARNING_RATE * grad;
 
@@ -302,17 +333,6 @@ std::vector<glm::vec2> gradientDescentPathOptimization(const std::vector<int>& r
 
         float newCost = totalPathLength(path);
         if (std::abs(newCost - prevCost) < GRAD_EPSILON) break;
-    }
-
-    // Final enforcement of radius constraint (double safety)
-    for (int i = 0; i < static_cast<int>(route.size()); ++i) {
-        glm::vec2 center = nodePositions[route[i]];
-        glm::vec2 offset = path[i] - center;
-        float dist = glm::length(offset);
-        if (dist > SENSOR_RADIUS) {
-            offset = (offset / dist) * SENSOR_RADIUS;
-            path[i] = center + offset;
-        }
     }
 
     return path;
@@ -356,7 +376,15 @@ __device__ float computePathLength(int* path, float* adj, int N) {
     return len;
 }
 
-
+/**
+ * @brief Initializes the random number generator (RNG) states for each thread (ant) using CURAND.
+ *
+ * This kernel is typically called once before the main simulation loop to seed each ants RNG.
+ * Each thread gets a unique RNG state stored in the states array.
+ *
+ * @param states Pointer to an array of curandState objects, one per thread (ant).
+ * @param seed   The global seed used to initialize all RNG states.
+ */
 __global__ void initRNG(curandState* states, unsigned long seed) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id < ANTS) {
@@ -364,7 +392,21 @@ __global__ void initRNG(curandState* states, unsigned long seed) {
     }
 }
 
-
+/**
+ * @brief Constructs one complete path per ant using probabilistic selection guided by pheromone levels and heuristic desirability.
+ *
+ * This kernel implements the solution construction phase of the Ant Colony Optimization (ACO) algorithm.
+ * Each thread represents an ant that constructs a path visiting all nodes exactly once, starting from the base station.
+ *
+ * @param N               Total number of nodes in the graph.
+ * @param baseStationIdx  Index of the starting node (typically the depot or base station).
+ * @param pheromones      Pointer to a flattened N x N pheromone matrix (row-major).
+ * @param adj             Pointer to a flattened N x N adjacency (distance) matrix (row-major).
+ * @param paths           Output array of size ANTS x N to store the paths for each ant.
+ * @param lengths         Output array of size ANTS to store the total path length for each ant.
+ * @param probabilities   Temporary buffer of size ANTS x N used to hold transition probabilities per ant.
+ * @param rngStates       Array of curandState for per-thread random number generation.
+ */
 __global__ void constructSolutions(
     int N, int baseStationIdx, float* pheromones, float* adj,
     int* paths, float* lengths, float* probabilities, curandState* rngStates){
@@ -426,6 +468,21 @@ __global__ void constructSolutions(
     rngStates[antIdx] = localState;
 }
 
+/**
+ * @brief Solves a Traveling Salesman-like routing problem using Ant Colony Optimization (ACO) with CUDA acceleration.
+ *
+ * This function offloads pheromone-guided route construction to the GPU. Each ant constructs a candidate solution,
+ * and pheromone trails are updated iteratively to reinforce shorter paths. The best path found is returned.
+ *
+ *  Note: I have another local branch with pheremone updates being done on the GPU, but there are some weird errors i am
+ *  dealing with that im not sure the reason for...
+ *
+ *
+ * @param adj            A 2D vector representing the symmetric N x N distance matrix between nodes.
+ * @param N              Number of nodes in the graph.
+ * @param baseStationIdx Index of the starting (and ending) node.
+ * @return The best path found, as a vector of node indices. The path ends with the baseStationIdx to indicate return.
+ */
 std::vector<int> antColonyCUDA(const std::vector<std::vector<float>>& adj, int N, int baseStationIdx) {
     float* d_adj, *d_pheromones;
     int* d_paths;
